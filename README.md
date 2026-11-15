@@ -1,8 +1,8 @@
 # Free Model Aggregator
 
 [![make.fun · free-model-aggregator-01](https://make.fun/badge/free-model-aggregator-01.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
-[![make.fun · rank](https://make.fun/badge/GeMseN-Test/free-model-aggregator/rank.svg)](https://make.fun/bounty/free-model-aggregator-01)
-[![make.fun · reward](https://make.fun/badge/GeMseN-Test/free-model-aggregator/reward.svg)](https://make.fun/bounty/free-model-aggregator-01)
+[![rank](https://make.fun/badge/free-model-aggregator-01/GeMseN-Test/free-model-aggregator/rank.svg)](https://make.fun/bounty/free-model-aggregator-01/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
+[![reward](https://make.fun/badge/free-model-aggregator-01/GeMseN-Test/free-model-aggregator/reward.svg)](https://make.fun/bounty/free-model-aggregator-01?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-01)
 
 Entry for the [make.fun bounty "The best free AI model aggregator"](https://make.fun/bounty/free-model-aggregator-01) (`free-model-aggregator-01`, $500).
 
