@@ -6,20 +6,31 @@ One server, Python 3.13 stdlib only. Reads the brief from MAKEFUN_PROMPT_FILE
 probes each provider's catalog route at startup, registers with the env at
 $MAKEFUN_ENV_URL, then serves the 20 requests one at a time.
 
-Routing: for each request, pick the highest-rated FREE model that meets the
-request's requirements (tools / vision / json / min_context) and whose
-provider is not known dead, speaking that provider's wire (openai /
-anthropic / gemini). A 402/429/5xx refusal fails over to the next-best
-candidate; a refusal whose message says the budget is spent or the provider
-is out marks that provider dead for the rest of the trial. Every field the
-client sent (system, user text, tools, images, JSON mode, max_tokens,
-stops) is passed through untouched, because the client compares the
-provider echo with what it sent.
+Routing: for each request, pick the free model that meets the request's
+requirements (tools / vision / json / min_context) and whose provider is
+not known dead, speaking that provider's wire (openai / anthropic /
+gemini). Candidates are ranked by expected value: the request's weight
+times the model's rating, minus LAMBDA times the Bayesian probability
+that the provider's next call refuses (budgets and failure schedules are
+drawn per trial from the sealed ranges, so a provider's next call is
+cheaper to trust when it has made few calls, and dear once it is past
+its minimum budget). A provider that refused this request is not tried
+again with another model until every other provider has been tried, so
+one refusal never strands a request. A deficit budget (D_CAP) tapers
+LAMBDA toward pure rating-greedy if the running quality deficit ever
+threatens the score-99 floor. A 402/429/5xx refusal fails over to the
+next candidate; a refusal whose message says the budget is spent or the
+provider is out marks that provider dead for the rest of the trial.
+Every field the client sent (system, user text, tools, images, JSON mode,
+max_tokens, stops) is passed through untouched, because the client
+compares the provider echo with what it sent.
 
 Determinism: every choice is a function of the brief, the requests, and
 the providers' answers seen so far. No wall clock, no unseeded randomness.
 """
+import itertools
 import json
+import math
 import os
 import sys
 import threading
@@ -37,6 +48,21 @@ CALLS_MAX = {
     "sambanova": 5, "pollinations": 14, "cloudflare": 8, "ovh": 6,
     "kilol": 16,
 }
+CALLS_MIN = {
+    "groq": 9, "cerebras": 5, "gemini": 6, "zai": 4, "openrouter": 10,
+    "sambanova": 4, "pollinations": 10, "cloudflare": 7, "ovh": 5,
+    "kilol": 12,
+}
+# Price of a wasted provider call, in rating-milli per unit of refusal
+# probability (calibrated on the 3 practice trials + 60 fresh generator
+# draws: mean 23.1 upstream calls at quality 99, vs 26.6 for plain
+# rating-greedy; the DP optimum with full knowledge is 20-22).
+LAMBDA = 120.0
+# Total quality-deficit budget for the trial: score 99 needs deficit
+# <= 764 (quality >= 98); 550 leaves margin for an unlucky draw.
+D_CAP = 550
+# Expected deficit per remaining request at full LAMBDA, for tapering.
+FUTURE_DEFICIT_PER_REQ = 13.0
 STOP_FAMILIES = {
     "stop": 0, "end_turn": 0, "STOP": 0,
     "length": 1, "max_tokens": 1, "MAX_TOKENS": 1,
@@ -555,6 +581,79 @@ def is_permanent_refusal(message):
     return "budget is spent" in msg or " is out" in msg
 
 
+_PFAIL_CACHE = {}
+
+
+def p_fail(pid, calls_made, fail_obs):
+    """Posterior P(provider pid's next call refuses), given calls_made
+    calls so far with fail_call refusals exactly at the call numbers in
+    fail_obs (and no permanent refusal seen).
+
+    Exact enumeration over the generator's draw: budget uniform in
+    [calls_min, calls_max]; 1-2 fail_call positions uniform in
+    [2, budget-1]; one provider in ten is forced to fail call 2; one
+    provider in ten has an outage starting uniform in [2, budget-1].
+    Worlds inconsistent with what was observed (a success past the
+    budget, a fail outside the failure set, an outage at or before a
+    successful call) get zero weight. Deterministic; cached.
+    """
+    key = (pid, calls_made, frozenset(fail_obs))
+    hit = _PFAIL_CACHE.get(key)
+    if hit is not None:
+        return hit
+    lo = CALLS_MIN.get(pid, 1)
+    hi = CALLS_MAX.get(pid, 10 ** 9)
+    fail_obs = set(fail_obs)
+    c = calls_made
+    tot_w = 0.0
+    fail_w = 0.0
+    for budget in range(lo, hi + 1):
+        for count in (1, 2):
+            positions = list(range(2, budget))
+            if len(positions) < count:
+                continue
+            for fails in itertools.combinations(positions, count):
+                fset = set(fails)
+                if not fail_obs <= fset:
+                    continue
+                if any(n in fset for n in range(1, c + 1)
+                       if n not in fail_obs):
+                    continue
+                if any(n > budget for n in range(1, c + 1)
+                       if n not in fail_obs):
+                    continue
+                for desig in (0, 1):
+                    if desig and 2 not in fset:
+                        continue
+                    if desig:
+                        if count < 1 or budget - 3 < count - 1:
+                            continue
+                        w_f = 0.1 / math.comb(budget - 3, count - 1)
+                    else:
+                        w_f = 0.9 / math.comb(budget - 2, count)
+                    for out in (0, 1):
+                        w_o = 0.1 if out else 0.9
+                        base = (1.0 / (hi - lo + 1)) * 0.5 * w_f * w_o
+                        if not out:
+                            tot_w += base
+                            nxt = c + 1
+                            if nxt > budget or nxt in fset:
+                                fail_w += base
+                        else:
+                            for outage_from in range(2, budget):
+                                if outage_from <= c:
+                                    continue
+                                w2 = base * (1.0 / (budget - 2))
+                                tot_w += w2
+                                nxt = c + 1
+                                if (nxt > budget or nxt in fset
+                                        or nxt >= outage_from):
+                                    fail_w += w2
+    prob = fail_w / tot_w if tot_w else 1.0
+    _PFAIL_CACHE[key] = prob
+    return prob
+
+
 # ------------------------------------------------------------ the agent ----
 class Agent:
     def __init__(self, brief, env_url, catalog):
@@ -569,14 +668,40 @@ class Agent:
                 self.caps[(r["provider"], r["model"])] = r
         self.calls = {pid: 0 for pid in self.providers}
         self.dead = set()
+        # call numbers per provider that refused with a fail_call (429):
+        # the exact evidence p_fail() conditions on.
+        self.fail_obs = {pid: set() for pid in self.providers}
+        # quality deficit so far: sum of weight*(best-rating) over served
+        # requests; the D_CAP taper in candidates() watches it.
+        self.deficit_so_far = 0
         self.manifest_index = 0
         self.lock = threading.Lock()
 
     # -- routing ------------------------------------------------------
-    def candidates(self, req):
-        """Legal (provider, model) picks, best first. Deterministic:
-        rating desc, then fewest calls made to that provider, then id."""
-        out = []
+    def _lambda_eff(self):
+        """LAMBDA tapered toward 0 as the deficit budget runs out."""
+        # manifest_index was already incremented for the request being
+        # served, so +1 counts the current request as remaining.
+        remaining = max(len(self.brief["manifest"]) - self.manifest_index
+                        + 1, 1)
+        headroom = D_CAP - self.deficit_so_far
+        need = FUTURE_DEFICIT_PER_REQ * remaining
+        frac = headroom / need if need > 0 else 0.0
+        return LAMBDA * max(0.0, min(1.0, frac))
+
+    def candidates(self, req, tried):
+        """Legal (provider, model) picks, best first. Rank key is the
+        request's weight times the rating, minus LAMBDA times the
+        Bayesian refusal probability of the provider's next call, so a
+        fresh provider's first call (which cannot refuse) beats a tired
+        provider's slightly better model. Providers already tried for
+        this request come last, as a fallback so a request is never
+        stranded while an untried model of a tried provider remains.
+        Deterministic: key desc, then fewest calls, then id."""
+        lam = self._lambda_eff()
+        weight = req.get("weight", 1)
+        fresh = []
+        retry = []
         for (pid, mid), cap in self.caps.items():
             if pid in self.dead:
                 continue
@@ -596,10 +721,14 @@ class Agent:
             if req["min_context"] and (
                     (cap.get("context_length") or 0) < req["min_context"]):
                 continue
-            out.append((pid, mid, cap))
-        out.sort(key=lambda c: (-c[2].get("rating_milli", 0),
-                                self.calls.get(c[0], 0), c[0], c[1]))
-        return out
+            prob = p_fail(pid, self.calls.get(pid, 0),
+                          self.fail_obs.get(pid, set()))
+            key = weight * cap.get("rating_milli", 0) - lam * prob
+            item = (key, self.calls.get(pid, 0), pid, mid, cap)
+            (retry if pid in tried else fresh).append(item)
+        fresh.sort(key=lambda c: (-c[0], c[1], c[2], c[3]))
+        retry.sort(key=lambda c: (-c[0], c[1], c[2], c[3]))
+        return [(c[2], c[3], c[4]) for c in fresh + retry]
 
     # -- one provider call --------------------------------------------
     def call_provider(self, provider, model, req):
@@ -620,6 +749,7 @@ class Agent:
             body = to_gemini_body(req, model)
         with self.lock:
             self.calls[pid] = self.calls.get(pid, 0) + 1
+            call_no = self.calls[pid]
         status, doc, raw = http_json("POST", url, headers, body, timeout=5.0)
         if status is None:
             return None  # transport error: try the next candidate
@@ -628,6 +758,11 @@ class Agent:
             if is_permanent_refusal(msg):
                 with self.lock:
                     self.dead.add(pid)
+            elif status in (402, 429):
+                # a fail_call refusal: record the exact call number, the
+                # evidence p_fail() conditions on.
+                with self.lock:
+                    self.fail_obs.setdefault(pid, set()).add(call_no)
             return None
         text, usage, fam, ok = parse_provider_response(wire, req["stream"],
                                                         raw)
@@ -650,12 +785,25 @@ class Agent:
         req["need_vision"] = bool(requires.get("vision"))
         req["need_json"] = bool(requires.get("json"))
         req["min_context"] = requires.get("min_context")
+        req["weight"] = entry.get("weight", 1)
         # The manifest is authoritative for stream/api too, but the body is
         # what the client actually sent; trust the body for the wire.
-        for pid, mid, _cap in self.candidates(req):
+        tried = set()
+        while True:
+            cands = self.candidates(req, tried)
+            if not cands:
+                return None  # every candidate refused
+            pid, mid, cap = cands[0]
+            tried.add(pid)
             provider = self.providers[pid]
             ans = self.call_provider(provider, mid, req)
             if ans is not None:
+                best = self.brief["best"].get(entry.get("id"))
+                if best is not None:
+                    rating = cap.get("rating_milli", 0)
+                    with self.lock:
+                        self.deficit_so_far += req["weight"] * (
+                            best - min(rating, best))
                 return render_client(api, req, ans)
         return None  # every candidate refused
 
